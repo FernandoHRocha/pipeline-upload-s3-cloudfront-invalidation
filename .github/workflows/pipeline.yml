@@ -1,0 +1,88 @@
+name: CI/CD - Build and Deploy to S3 and CloudFront invalidation
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  
+concurrency:
+  group: deploy-to-s3
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BUILD_DIR: dist
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: AWS
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+  
+      - name: Install dependencies
+        run: npm ci
+  
+      - name: Build project
+        run: npm run build --if-present
+  
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5.1.0
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  
+      - name: Sync built files to S3 (static assets, long cache)
+        run: |
+          aws s3 sync "${{ env.BUILD_DIR }}/" "s3://${{ env.S3_BUCKET }}/" \
+            --delete \
+            --exclude "src/assets/*" \
+            --exclude "index.html" \
+            --cache-control "max-age=31536000, public"
+
+          aws s3 sync "${{ env.BUILD_DIR }}/" "s3://${{ env.S3_BUCKET }}/" \
+            --exclude "*" \
+            --include "*.js" \
+            --include "*.css" \
+            --cache-control "max-age=300, public"
+  
+      - name: Upload index.html with no-cache (single-page apps)
+        if: ${{ always() }}
+        run: |
+          if [ -f "${{ env.BUILD_DIR }}/index.html" ]; then
+            aws s3 cp "${{ env.BUILD_DIR }}/index.html" "s3://${{ env.S3_BUCKET }}/index.html" \
+              --content-type "text/html; charset=utf-8" \
+              --cache-control "no-cache, no-store, must-revalidate"
+          else
+            echo "index.html not found in ${{ env.BUILD_DIR }}/ — skipping special upload"
+          fi
+  
+      - name: Create CloudFront invalidation
+        if: ${{ env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ env.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
